@@ -60,6 +60,7 @@ struct StartAlignmentTests {
         ctx.deviceChangeProvider.finish()
     }
 
+    /// A thrown hardware error must be preserved while cleaning up mic resources.
     @Test("If mic start fails, system engine is not started")
     func micFailureDoesNotStartSystem() async throws {
         let ctx = try TestRecorderFactory.make()
@@ -100,6 +101,7 @@ struct StartAlignmentTests {
         }
     }
 
+    /// A zero timestamp is a valid delivered anchor, distinct from a missing buffer.
     @Test("Mic anchor is forwarded to system engine, including a valid zero anchor", arguments: [0.0, 42.5])
     func micAnchorForwardedToSystem(anchor: Double) async throws {
         let ctx = try TestRecorderFactory.make()
@@ -118,6 +120,7 @@ struct StartAlignmentTests {
 
     // MARK: - Mic startup recovery
 
+    /// Exhausted startup must remain idle, release both attempts and allow a retry.
     @Test("A mic that never delivers buffers fails startup instead of recording an empty track")
     func stalledMicFailsStartup() async throws {
         let ctx = try TestRecorderFactory.make()
@@ -148,6 +151,7 @@ struct StartAlignmentTests {
         await ctx.recorder.stop()
     }
 
+    /// Only the successful retry's timestamp may align the system recording.
     @Test("A stalled mic is restarted before system capture and uses the recovered anchor")
     func stalledMicRecovers() async throws {
         let ctx = try TestRecorderFactory.make()
@@ -164,6 +168,7 @@ struct StartAlignmentTests {
         await ctx.recorder.stop()
     }
 
+    /// Cancellation must release the waiting attempt without advancing to system audio.
     @Test("Cancellation while waiting for the mic stops capture without starting system audio")
     func cancelledMicStartup() async throws {
         let ctx = try TestRecorderFactory.make()

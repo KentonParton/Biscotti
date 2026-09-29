@@ -33,7 +33,8 @@ public protocol CaptureEngine: Sendable {
     ///
     /// Called by `AudioRecorder` before `start()`. Mic engines must provide this
     /// signal for startup to succeed. System engines can use the no-op default.
-    /// Pass `nil` to clear a previously registered callback.
+    /// Pass `nil` to clear the registration for future starts. Callbacks already
+    /// installed for an attempt remain bound to that attempt, never to a retry.
     func setOnFirstBuffer(_ callback: (@Sendable (Double) -> Void)?)
 
     /// Sets the mic's first-buffer host-clock anchor (seconds) so the

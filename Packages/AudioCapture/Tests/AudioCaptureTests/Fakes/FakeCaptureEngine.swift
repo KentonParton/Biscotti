@@ -118,6 +118,8 @@ final class FakeCaptureEngine: CaptureEngine, @unchecked Sendable {
         state.withLock { $0.micAnchor = seconds }
     }
 
+    /// Records the attempt, applies configured failures and optionally delivers
+    /// an anchor before notifying the test that hardware startup completed.
     func start(writingTo url: URL) async throws {
         let (error, anchor) = state.withLock { locked -> ((any Error)?, Double) in
             locked.startCount += 1

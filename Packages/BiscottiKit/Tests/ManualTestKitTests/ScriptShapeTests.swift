@@ -19,6 +19,7 @@ struct ScriptShapeTests {
         #expect(script.id == "transcription")
     }
 
+    /// The headset/display regression remains part of the complete manual sequence.
     @Test("Audio Capture script has exactly 18 steps")
     func audioCaptureStepCount() {
         #expect(TestScript.audioCapture.steps.count == 18)
@@ -29,6 +30,7 @@ struct ScriptShapeTests {
         #expect(TestScript.transcription.steps.count == 4)
     }
 
+    /// Saved manual results must use these stable IDs, including the new regression.
     @Test("Audio Capture step IDs match the canonical set")
     func audioCaptureStepIDs() {
         let ids = Set(TestScript.audioCapture.steps.map(\.id))

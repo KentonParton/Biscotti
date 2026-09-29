@@ -250,6 +250,8 @@ public actor AudioRecorder {
         )
     }
 
+    /// Binds one startup attempt to its own anchor stream and releases that
+    /// registration on success, timeout, cancellation or engine failure.
     private func startMicAttempt(path: URL) async throws -> Double? {
         // Create a one-shot async stream: the callback yields the anchor,
         // and we read it (with timeout) after start returns.

@@ -68,3 +68,24 @@ The `ac_headset_startup` manual step requires successful repeated recording with
 both local and remote speech; an explicit startup error is a failure. The broader
 AudioCapture manual suite remains marked `not-run` under the repository's staleness
 rule. The targeted end-to-end hardware validation above is recorded separately.
+
+## Review follow-up: callbacks from retired capture attempts
+
+The hardware validation above predates this follow-up. Review identified a
+conditional race: if a removed tap delivers a late callback after a retry opens
+its file, shared mutable file/callback state could mistake it for the new attempt's
+audio. Whether the platform delivers such a callback on the reported setup is
+unverified; correctness no longer relies on callback draining during teardown.
+
+`MicCaptureSession` now owns one attempt's file, converter and immutable first-buffer
+callback. Each installed tap has its own identity. Validation, conversion, writing
+and first-anchor selection share a lock with tap invalidation and file closing;
+the audio callback only tries that lock and drops the buffer on contention.
+Retired callbacks cannot write into or mark a replacement tap as delivering audio.
+A callback already selected before close remains bound to the old attempt's stream.
+
+Deterministic tests exercise late callbacks after close/retry and tap replacement,
+verify the resulting AAC files, and check that valid replacement taps preserve
+recorded audio and the session's original anchor. These tests do not activate audio
+hardware. The same-engine/VPIO recovery sequence is retained, but this follow-up
+has not yet been rerun on the Bose-and-displays setup.
