@@ -2,6 +2,7 @@ import AudioToolbox
 @preconcurrency import AVFoundation
 import Foundation
 import os
+import Synchronization
 
 private let logger = Logger(subsystem: "net.scosman.biscotti.audiocapture", category: "LiveMicCapture")
 
@@ -15,10 +16,12 @@ final class MicCaptureSession: @unchecked Sendable {
     private let processingFormat: AVAudioFormat
     private let onFirstBuffer: (@Sendable (Double) -> Void)?
     private let lock = OSAllocatedUnfairLock()
-    // All mutable state below is protected by lock.
+    /// Lifecycle reads must not contend with the audio callback for the write lock.
+    private let deliveredBuffer = Atomic<Bool>(false)
+
+    // The remaining mutable state is protected by lock.
     private var file: ExtAudioFileRef?
     private var activeTap: Tap?
-    private var deliveredBuffer = false
     private var didNotifyFirstBuffer = false
     private var converter: AVAudioConverter?
     private var converterSourceFormat: AVAudioFormat?
@@ -36,9 +39,7 @@ final class MicCaptureSession: @unchecked Sendable {
     /// Whether the currently installed tap has received nonempty hardware audio.
     /// Replacing the tap resets this without resetting the session's first anchor.
     var hasDeliveredBuffer: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return deliveredBuffer
+        deliveredBuffer.load(ordering: .acquiring)
     }
 
     /// Creates the callback installed on AVAudioEngine and retires the previous
@@ -47,7 +48,7 @@ final class MicCaptureSession: @unchecked Sendable {
         let tap = Tap()
         lock.lock()
         activeTap = tap
-        deliveredBuffer = false
+        deliveredBuffer.store(false, ordering: .releasing)
         converter = nil
         converterSourceFormat = nil
         lock.unlock()
@@ -62,7 +63,7 @@ final class MicCaptureSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         activeTap = nil
-        deliveredBuffer = false
+        deliveredBuffer.store(false, ordering: .releasing)
         converter = nil
         converterSourceFormat = nil
     }
@@ -73,7 +74,7 @@ final class MicCaptureSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         activeTap = nil
-        deliveredBuffer = false
+        deliveredBuffer.store(false, ordering: .releasing)
         if let file { ExtAudioFileDispose(file) }
         file = nil
         converter = nil
@@ -84,7 +85,7 @@ final class MicCaptureSession: @unchecked Sendable {
     deinit { close() }
 
     /// Converts and writes only for the active tap. Ownership validation, graph
-    /// readiness and first-anchor selection are serialized with invalidation.
+    /// readiness updates and first-anchor selection are serialized with invalidation.
     private func handleTap(buffer: AVAudioPCMBuffer, when: AVAudioTime, tap: Tap) {
         guard buffer.frameLength > 0, lock.lockIfAvailable() else { return }
         let anchor = writeBufferIfCurrent(buffer, when: when, tap: tap)
@@ -98,7 +99,7 @@ final class MicCaptureSession: @unchecked Sendable {
     /// rejected, empty, unconvertible or failed buffers cannot confirm startup.
     private func writeBufferIfCurrent(_ buffer: AVAudioPCMBuffer, when: AVAudioTime, tap: Tap) -> Double? {
         guard activeTap === tap, let file else { return nil }
-        deliveredBuffer = true
+        deliveredBuffer.store(true, ordering: .releasing)
         guard let mono = VPIOBufferHelper.extractChannel0(buffer) else { return nil }
         let bufferToWrite: AVAudioPCMBuffer
         if mono.format.sampleRate == processingFormat.sampleRate {
