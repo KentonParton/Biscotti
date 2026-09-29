@@ -13,10 +13,6 @@ private let logger = Logger(subsystem: "net.scosman.biscotti.audiocapture", cate
 /// VPIO is the only route to loud, normalised, noise-suppressed mono.
 /// Thin hardware adapter -- orchestration lives in `AudioRecorder`.
 final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftlint:disable:this type_body_length
-    #if DEBUG
-        nonisolated(unsafe) static var verboseDiagnostics = true
-    #endif
-
     private let encoder: EncoderSettings
     private let processingFormat: AVAudioFormat
 
@@ -53,7 +49,7 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
 
     var onUnrecoverableError: (@Sendable (Error) -> Void)?
 
-    /// Callback fired exactly once when the first tap buffer is delivered.
+    /// Callback fired once after the first audio buffer is written successfully.
     /// Argument: host-clock anchor (seconds) — the recording's t=0.
     /// Route-change rebuilds do NOT re-fire this.
     ///
@@ -111,15 +107,9 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
         // AudioRecorder can start the system engine against a stable rate.
         // Route-change rebuilds remain fire-and-forget via handleConfigurationChange.
         //
-        // The config-change observer is installed AFTER the engine starts,
-        // not before, to prevent a race: enabling VPIO changes the audio
-        // graph, which can fire AVAudioEngineConfigurationChange. If the
-        // observer is active during the initial build, that notification
-        // queues a teardown+rebuild on engineQueue that runs immediately
-        // after the build — destroying the engine before it delivers any
-        // mic buffers. Under Release optimizations the tighter timing
-        // makes this race deterministic, causing a first-buffer timeout
-        // and silent recording failure.
+        // Install the observer after initial setup so enabling VPIO does not
+        // queue recovery for an unfinished graph. Later settling notifications
+        // are handled according to the current engine's running/buffer state.
         do {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 engineQueue.async { [self] in
@@ -220,13 +210,26 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
             enableAdvancedDucking: false, duckingLevel: .min
         )
 
+        try installCaptureGraphAndStart(newEngine)
+    }
+
+    /// Re-query the hardware format for both initial setup and startup recovery.
+    /// The existing voice-processing unit stays enabled when recovering a stopped
+    /// engine, so recovery does not recreate the aggregate device that just settled.
+    private func installCaptureGraphAndStart(_ engine: AVAudioEngine) throws {
+        let input = engine.inputNode
         let tapFormat = input.outputFormat(forBus: 0)
-        #if DEBUG
-            if Self.verboseDiagnostics {
-                logger.info("[diag] VPIO input tap: rate=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
-            }
-        #endif
-        attachSilentOutput(to: newEngine, inputRate: tapFormat.sampleRate)
+        guard tapFormat.sampleRate > 0, tapFormat.channelCount > 0 else {
+            throw CaptureError.micEngineFailed("The microphone has no usable audio format.")
+        }
+        let inputID = CoreAudioHelpers.defaultInputDeviceID() ?? 0
+        let outputID = CoreAudioHelpers.defaultOutputDeviceID() ?? 0
+        let inputRate = CoreAudioHelpers.nominalSampleRate(for: inputID) ?? 0
+        let outputRate = CoreAudioHelpers.nominalSampleRate(for: outputID) ?? 0
+        let inputName = CoreAudioHelpers.deviceName(for: inputID) ?? "unknown"
+        let outputName = CoreAudioHelpers.deviceName(for: outputID) ?? "unknown"
+        logger.notice("Mic setup: input=\(inputName) id=\(inputID, privacy: .public) rate=\(inputRate, privacy: .public); output=\(outputName) id=\(outputID, privacy: .public) rate=\(outputRate, privacy: .public); tap rate=\(tapFormat.sampleRate, privacy: .public) channels=\(tapFormat.channelCount, privacy: .public)")
+        attachSilentOutput(to: engine, inputRate: tapFormat.sampleRate)
 
         input.installTap(
             onBus: 0, bufferSize: 1024, format: tapFormat
@@ -234,22 +237,39 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
             self?.handleTap(buffer: buffer, when: when)
         }
 
-        newEngine.prepare()
-        try newEngine.start()
+        engine.prepare()
+        try engine.start()
     }
 
-    /// Non-throwing wrapper for route-change rebuilds.
-    private func buildAndStartEngine(context: String) {
+    private func recoverEngineAfterConfigurationChange(_ current: AVAudioEngine, hasDeliveredBuffer: Bool) {
         do {
-            try buildAndStartEngineOrThrow()
+            if hasDeliveredBuffer {
+                logger.notice("Config-change honoured — rebuilding mic engine after audio delivery")
+                teardownEngine()
+                try buildAndStartEngineOrThrow()
+            } else {
+                // Recreating VPIO on every pre-buffer stop repeatedly provokes the
+                // same startup configuration change on some Bluetooth/display routes.
+                // Keep the stopped engine and VPIO unit; refresh only our tap/output.
+                logger.notice("Config-change honoured — restarting existing mic engine during startup")
+                current.inputNode.removeTap(onBus: 0)
+                if let node = silenceNode { current.detach(node) }
+                silenceNode = nil
+                cachedConverter = nil
+                cachedConverterSourceHash = 0
+                try installCaptureGraphAndStart(current)
+                logger.notice("Mic startup restart completed: running=\(current.isRunning, privacy: .public)")
+            }
         } catch {
-            logger.error("VPIO engine setup failed (\(context)): \(error.localizedDescription)")
+            logger.error("Mic configuration recovery failed: \(error.localizedDescription, privacy: .public)")
+            // stop() becomes a no-op once capturingFlag is cleared. Remove the
+            // observer here so a later startup retry cannot leave it registered.
+            removeConfigChangeObserver()
             teardownEngine()
             restoreOutputRate()
             closeExtFile()
             capturingFlag.store(false, ordering: .releasing)
-            // Dispatch off engineQueue to avoid deadlock if the handler
-            // calls stop() (which does engineQueue.sync).
+            // Keep the error handler off the serial engine lifecycle queue.
             let handler = onUnrecoverableError
             DispatchQueue.global().async { handler?(error) }
         }
@@ -265,21 +285,16 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
         if outputRateOverride == nil {
             outputRateOverride = (outID, outRate)
         }
-        CoreAudioHelpers.setNominalSampleRate(inRate, for: outID)
+        let status = CoreAudioHelpers.setNominalSampleRate(inRate, for: outID)
+        logger.notice("Mic output rate request: device=\(outID, privacy: .public), from=\(outRate, privacy: .public), target=\(inRate, privacy: .public), status=\(status, privacy: .public)")
         for _ in 0 ..< 40 {
             if let now = CoreAudioHelpers.nominalSampleRate(for: outID),
                abs(now - inRate) < 1
             { break }
             usleep(25000)
         }
-        #if DEBUG
-            if Self.verboseDiagnostics {
-                let rateAfter = CoreAudioHelpers.nominalSampleRate(for: outID) ?? 0
-                let name = CoreAudioHelpers.deviceName(for: outID) ?? "unknown"
-                let msg = "output=\"\(name)\" id=\(outID) before=\(outRate) inputTarget=\(inRate) after=\(rateAfter)"
-                logger.info("[diag] rate match: \(msg)")
-            }
-        #endif
+        let rateAfter = CoreAudioHelpers.nominalSampleRate(for: outID) ?? 0
+        logger.notice("Mic output rate after request: device=\(outID, privacy: .public), actual=\(rateAfter, privacy: .public)")
     }
 
     private func restoreOutputRate() {
@@ -367,14 +382,14 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
     /// (same as `removeConfigChangeObserver`) so `configObserver` is
     /// accessed from a single serial context.
     private func installConfigChangeObserver() {
-        // object: nil is intentional. buildAndStartEngine creates a fresh
-        // AVAudioEngine on every rebuild, so scoping to a specific instance
-        // would go stale after the first route-change rebuild. This is safe:
-        // LiveMicCaptureEngine is the only AVAudioEngine in the package (the
-        // system engine uses Core Audio taps, not AVAudioEngine).
+        // Follow rebuilt engines, but ignore queued notifications from an old
+        // graph or another AVAudioEngine in this process.
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil
-        ) { [weak self] _ in self?.handleConfigurationChange() }
+        ) { [weak self] notification in
+            guard let source = notification.object as? AVAudioEngine else { return }
+            self?.handleConfigurationChange(engineID: ObjectIdentifier(source))
+        }
     }
 
     /// Removes the config-change observer. Must run on `engineQueue`
@@ -388,54 +403,45 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
         }
     }
 
-    /// Handles `AVAudioEngineConfigurationChange`. The key insight: enabling
-    /// VPIO creates an aggregate device and reconfigures IO scopes, which
-    /// fires a config-change notification ~50-100ms AFTER `engine.start()`.
-    /// This is a one-shot settling event, NOT a genuine route change. If we
-    /// tear down the engine on this notification, it never delivers a buffer
-    /// and mic recording silently fails.
-    ///
-    /// Strategy: absorb config-change notifications that arrive before the
-    /// current engine has delivered its first tap buffer (the "startup-settle
-    /// window"). Once the first buffer arrives we know the VPIO graph is
-    /// stable and any subsequent config-change is a genuine route change that
-    /// warrants a rebuild.
-    private func handleConfigurationChange() {
+    /// A configuration notification may arrive after VPIO starts but before its
+    /// first buffer. Ignore it only if the current engine is still running. If it
+    /// stopped, restart the existing graph without toggling voice processing;
+    /// recreating that unit can reproduce the startup change indefinitely.
+    /// AudioRecorder independently bounds the wait for the first written buffer.
+    private func handleConfigurationChange(engineID: ObjectIdentifier) {
         engineQueue.async { [weak self] in
-            guard let self, !isTearingDown else { return }
+            guard let self, !isTearingDown, capturingFlag.load(ordering: .acquiring),
+                  let engine, ObjectIdentifier(engine) == engineID else { return }
 
             let settled = currentEngineBufferDelivered.load(ordering: .acquiring)
+            let running = engine.isRunning
+            logger.notice("Mic config change: running=\(running, privacy: .public), bufferDelivered=\(settled, privacy: .public)")
 
-            if !settled {
+            if !settled, running {
                 // Absorb: this is the VPIO startup-settle config change.
                 logger.info("Config-change absorbed during startup settle (no buffer yet)")
                 return
             }
 
-            logger.notice("Config-change honoured — rebuilding (route change)")
-            teardownEngine()
-            buildAndStartEngine(context: "route change")
+            recoverEngineAfterConfigurationChange(engine, hasDeliveredBuffer: settled)
         }
     }
 
     // MARK: - Tap (real-time audio thread)
 
     private func handleTap(buffer: AVAudioPCMBuffer, when: AVAudioTime) {
+        guard buffer.frameLength > 0 else { return }
         // Mark that this engine build has delivered a buffer. This arms the
         // config-change handler to honour subsequent notifications (the
         // startup-settle window is over). The store is idempotent after the
         // first buffer. The `.releasing` store pairs with the `.acquiring`
         // load in `handleConfigurationChange` for a proper release/acquire
-        // edge, though even a relaxed store would suffice for correctness
-        // here: the engineQueue reader only needs eventual visibility (a
-        // single extra absorbed notification is harmless; a missed genuine
-        // route change is impossible because route changes fire repeatedly
-        // until honoured).
+        // edge. A stopped engine must be recovered even if this flag is false;
+        // configuration notifications are not guaranteed to repeat.
         if !currentEngineBufferDelivered.load(ordering: .relaxed) {
             currentEngineBufferDelivered.store(true, ordering: .releasing)
         }
 
-        notifyFirstBufferIfNeeded(when)
         guard let mono = VPIOBufferHelper.extractChannel0(buffer) else { return }
 
         let targetFormat = processingFormat
@@ -459,7 +465,9 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
         guard os_unfair_lock_trylock(&_fileLock) else { return }
         defer { os_unfair_lock_unlock(&_fileLock) }
         guard let file = currentExtFile() else { return }
-        VPIOBufferHelper.writeBuffer(bufferToWrite, to: file)
+        if VPIOBufferHelper.writeBuffer(bufferToWrite, to: file) == noErr {
+            notifyFirstBufferIfNeeded(when)
+        }
     }
 
     /// Fires `onFirstBuffer` exactly once with the host-clock seconds of the
@@ -473,7 +481,7 @@ final class LiveMicCaptureEngine: CaptureEngine, @unchecked Sendable { // swiftl
         } else {
             0
         }
-        logger.info("First mic buffer delivered -- anchor=\(anchor)s")
+        logger.notice("First mic buffer delivered -- anchor=\(anchor, privacy: .public)s")
         onFirstBuffer?(anchor)
     }
 

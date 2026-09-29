@@ -24,6 +24,7 @@ final class FakeCaptureEngine: CaptureEngine, @unchecked Sendable {
         /// Anchor value the fake fires via `onFirstBuffer` on start. Set
         /// via `setFirstBufferAnchor(_:)` before calling start. Default 0.
         var firstBufferAnchor: Double = 0
+        var startsWithoutBuffers = 0
     }
 
     private let state = Mutex(State())
@@ -102,6 +103,11 @@ final class FakeCaptureEngine: CaptureEngine, @unchecked Sendable {
         state.withLock { $0.firstBufferAnchor = anchor }
     }
 
+    /// Model a successful hardware start that never services the input tap.
+    func suppressFirstBuffer(forStarts count: Int) {
+        state.withLock { $0.startsWithoutBuffers = count }
+    }
+
     /// Simulate the mic engine delivering its first buffer. Fires
     /// `onFirstBuffer` with the given anchor, just like the real mic engine.
     func simulateFirstBuffer(anchor: Double) {
@@ -136,8 +142,14 @@ final class FakeCaptureEngine: CaptureEngine, @unchecked Sendable {
         // For a fake mic engine: auto-fire the first-buffer callback so
         // AudioRecorder's startMicAndWaitForAnchor completes without a
         // timeout. Real engines fire this from the actual audio tap.
-        let callback = onFirstBuffer
-        callback?(anchor)
+        let shouldDeliver = state.withLock { locked in
+            if locked.startsWithoutBuffers > 0 {
+                locked.startsWithoutBuffers -= 1
+                return false
+            }
+            return true
+        }
+        if shouldDeliver { onFirstBuffer?(anchor) }
 
         // Notify test hooks that the engine started successfully.
         onStart?()
